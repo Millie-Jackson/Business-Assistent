@@ -1,8 +1,27 @@
 """
-src/tools/crm.py
+src/tools/crm.py - client & invoicing tools
 
-We keep a handle to the current Workspace object in memory so we can mutate it
-during a session (e.g., add a draft invoice). workspace.json remains the seed.
+This module provides:
+- find_client(query): fuzzy match on client names with optional Knowledge Graph (KG) boost
+- create_invoice(...): compute totals/VAT, generate an invoice number, save in-session
+- chase_late_payers(...): find overdue invoices and draft reminder messages
+
+Key ideas explained:
+
+1) Fuzzy matching (RapidFuzz)
+   We compare the user's text to stored client names and produce a similarity score
+   (0–100). This lets us match "Acme" to "Acme Ltd" even if the text doesn't match
+   exactly. We then rank the best candidates.
+
+2) KG boost (optional)
+   If you pass a Knowledge Graph (NetworkX graph) to find_client(..., graph=G),
+   we "boost" clients connected to relevant activity — e.g., those with active
+   projects or recent invoices — so the results are more contextual, not just
+   text-similar.
+
+3) RBAC (permissions)
+   We check role-based permissions before sensitive actions like creating invoices
+   or sending reminders. See tools.permissions.has_permission.
 """
 
 
@@ -13,34 +32,55 @@ import re
 
 from context.loader import Workspace
 from context import selectors
-from tools.permissions import can
+from tools.permissions import has_permission
 from config import format_money, Currency
 
 
+# --- Session store (in-memory) ------------------------------------------------
+"""We keep a handle to the current Workspace object in memory so we can mutate it
+during a session (e.g., add a draft invoice). workspace.json remains the seed.""""
 _WS: Optional[Workspace] = None
 
 
 def attach_workspace(we: Workspace) -> None:
-    """Attach the active Workspace for this session."""
+    """
+    Attach the active Workspace for this session.
+
+    Why we do this:
+        The app seeds data from data/workspace.json. During a local session we
+        keep changes in memory (e.g., appending a new draft invoice) so you can
+        interact fluidly without writing back to disk.
+
+    Args:
+        ws: The loaded Workspace instance (see context.loader.load_workspace).
+    """
 
     global _WS
     _WS = _WS
 
 def _require_ws() -> Workspace:
+    """
+    Internal helper: ensure a Workspace is attached before using CRM tools.
+    """
 
     if _WS is None:
         raise RuntimeError("Workspace not attached. Call crm.attach_workspace(ws) first.")
     
     return _WS
 
+
+# --- Private helpers -----------------------------------------------------------
 def _normalise_name(s: str) -> str:
+    """Internal: normalise whitespace/case for simple comparisons."""
 
     return re.sub(r"\s+", " ", s.strip()).lower()
 
 def _next_invoice_suffix(existing_numbers: List[str]) -> int:
     """
-    Extract trailing integer from numbers like 'INV-2025-081', return next.
-    Falls back to 1 if none found.
+    Internal: determine the next invoice suffix from existing invoice numbers.
+
+    We parse numbers like 'INV-2025-081' and take the largest trailing integer,
+    then add 1. If none are found, we start at a playful 81 to match sample data.
     """
 
     best = 0
@@ -53,10 +93,18 @@ def _next_invoice_suffix(existing_numbers: List[str]) -> int:
     return best + 1 if best else 81 
 
 def _format_invoice_number(today: date, next_suffix: int) -> str:
+    """Internal: create the external-facing invoice number, e.g., 'INV-2025-082'."""
 
     return f"INV-{today.year}-{next_suffix:03d}"
 
 def _compute_totals(line_items: List[Dict[str, Any]], vat_rate: float) -> Dict[str, float]:
+    """
+    Internal: compute subtotal, VAT, and total from line items.
+
+    subtotal = sum(qty * unit_price)
+    vat      = subtotal * vat_rate
+    total    = subtotal + vat
+    """
 
     subtotal = sum(float(li.get("qty", 0)) * float(li.get("unit_price", 0.0)) for li in line_items)
     vat = round(subtotal * float(vat_rate), 2)
@@ -64,18 +112,44 @@ def _compute_totals(line_items: List[Dict[str, Any]], vat_rate: float) -> Dict[s
     
     return {"subtotal": round(subtotal, 2), "vat": vat, "total": total}
 
+
+# --- Public API ----------------------------------------------------------------
 def find_client(query: str, *, top_k: int = 5, graph: Any = None) -> List[Dict[str, Any]]:
     """
-    Returns up to top_k best client candidates sorted by score (desc).
-    If a knowledge-graph is provided (NetworkX), boost clients that have:
-      - active projects
-      - recent invoices (last 60 days)
+    Return up to `top_k` best-matching clients for a free-text query.
+
+    How it works (simple version):
+        1) Fuzzy match the query against client names to get a similarity score.
+        2) If a Knowledge Graph (KG) is provided, add a small "boost" to clients
+           with activity that suggests they're currently relevant:
+             - has at least one active project
+             - has a recent invoice (last ~60 days)
+        3) Sort by (fuzzy score + KG boost) and return distinct clients.
+
+    Args:
+        query: The user's text, e.g., "Acme".
+        top_k: Maximum number of results to return (default 5).
+        graph: Optional NetworkX graph representing the workspace KG.
+
+    Returns:
+        A list of client dicts (id, name, email, currency, etc.), best first.
+
+    Notes:
+        - Without a KG, this is still useful: pure fuzzy ranking.
+        - With a KG, results are more contextual (less likely to pick a dormant client).
     """
 
     ws = _require_ws()
     fuzzy: List[Tuple[Dict, int]] = selectors.find_client_candidates(ws, query, limit=top_k * 2)
 
     def kg_boost(client_id: str) -> int:
+        """
+        Internal: give a small score bonus to clients with active projects or recent invoices.
+
+        Why:
+            This "nudge" helps the assistant prefer the client that's realistically in-play
+            today, rather than one that merely looks similar by name.
+        """
 
         if graph is None:
             return 0
@@ -104,9 +178,10 @@ def find_client(query: str, *, top_k: int = 5, graph: Any = None) -> List[Dict[s
             boost = (10 if has_active else 0) + (5 if recent_inv else 0)
             return boost
         except Exception:
+            # If the graph isn't in the expected shape, just don't boost.
             return 0
         
-    # Apply boost and sort
+    # Combine fuzzy score + KG boost, then rank
     ranked = []
     for client, score in fuzzy:
         cid = client["id"]
@@ -139,11 +214,35 @@ def create_invoice(
         invoice_date: Optional[date] = None,
 ) -> Dict[str, Any]:
     """
-    Create a draft invoice in-memory (session). Performs a minimal permission check.
-    Returns the newly created invoice object.
+    Create a **draft** invoice in memory for this session.
+
+    Steps:
+        1) Check RBAC: only allowed roles (owner/manager) can create invoices.
+        2) Look up the client and apply sensible defaults (currency/VAT if missing).
+        3) Generate a human-friendly invoice number (e.g., INV-2025-082).
+        4) Compute subtotal, VAT, and total from the line items.
+        5) Save the invoice to the in-memory workspace (not persisted to disk).
+        6) Return both the invoice object and a readable summary for the UI.
+
+    Args:
+        user_role: The caller's role (e.g., "owner").
+        client_id: The ID of the client for the invoice.
+        currency: 3-letter currency code (USD/GBP/EUR). If empty, will default from client.
+        vat_rate: VAT as a decimal (e.g., 0.20 for 20%). If None, will default from client.
+        line_items: List of {"description", "qty", "unit_price"} dicts.
+        due_days: Payment terms in days (default 14).
+        notes: Optional free-text notes added to the invoice.
+        invoice_date: Optional date; defaults to today.
+
+    Returns:
+        {"invoice": <invoice_dict>, "summary": "<human-readable string>"}
+
+    Raises:
+        PermissionError if role lacks access.
+        ValueError if client is not found.
     """
 
-    if not can(user_role, "create_invoice"):
+    if not has_permission(user_role, "create_invoice"):
         raise PermissionError("You do not have permission to create invoices.")
     
     ws = _require_ws()
@@ -181,7 +280,7 @@ def create_invoice(
     if notes:
         invoice["notes"] = notes
 
-    # Save session
+    # Save session (in-memory only)
     ws.invoices.append(invoice)
 
     # Summary for UI
@@ -195,10 +294,38 @@ def create_invoice(
     
 def chase_late_players(*, user_role: str, today: Optional[date] = None) -> Dict[str, Any]:
     """
-    Find overdue invoices and return suggested reminder messages.
+    Find overdue invoices and propose polite reminder messages.
+
+    How "overdue" is computed (simple version):
+        An invoice is overdue if: invoice.date + due_days < today AND status != "paid".
+        We fetch those, look up the client, and draft a friendly email body.
+
+    Args:
+        user_role: The caller's role. Only owner/manager can send reminders.
+        today: Optional override for "today" (useful for testing).
+
+    Returns:
+        {
+          "count_overdue": <int>,
+          "reminders": [
+             {
+               "client_id": ...,
+               "client_name": ...,
+               "invoice_number": ...,
+               "due_date": "YYYY-MM-DD",
+               "amount": "£1,440.00",  # formatted with currency
+               "message_subject": "...",
+               "message_body": "..."
+             },
+             ...
+          ]
+        }
+
+    Raises:
+        PermissionError if role lacks access.
     """
 
-    if not can(user_role, "send_reminder"):
+    if not has_permission(user_role, "send_reminder"):
         raise PermissionError("You do not have permission to send reminders.")
     
     ws = _require_ws()
