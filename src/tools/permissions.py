@@ -22,6 +22,7 @@ ACTION_MATRIX = {
     "create_invoice": {"owner", "manager"},
     "send_reminder": {"owner", "manager"},
     "record_payment": {"owner", "manager"},
+    "record_expense": {"owner", "manager"},
     "create_task": {"owner", "manager", "member"},
     "move_task": {"owner", "manager", "member"},
 }
