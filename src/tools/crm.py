@@ -292,7 +292,7 @@ def create_invoice(
 
     return {"invoice": invoice, "summary": summary}
     
-def chase_late_players(*, user_role: str, today: Optional[date] = None) -> Dict[str, Any]:
+def chase_late_payers(*, user_role: str, today: Optional[date] = None) -> Dict[str, Any]:
     """
     Find overdue invoices and propose polite reminder messages.
 
